@@ -27,7 +27,7 @@ PROFILE: str = os.environ.get("BLE_PROFILE", "P031")
 HOST: str = "0.0.0.0"
 PORT: int = int(os.environ.get("RELAY_PORT", "9000"))
 
-_MIN_WRITE_INTERVAL: float = 0.025  # 25 ms → 40 Hz BLE cap
+_MIN_WRITE_INTERVAL: float = 0.033  # 33 ms → 30 Hz BLE cap
 
 log = logging.getLogger("relay")
 

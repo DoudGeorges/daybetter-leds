@@ -42,13 +42,13 @@ if TYPE_CHECKING:
 RELAY_HOST: str = os.environ.get("RELAY_HOST", "192.168.2.122")
 RELAY_PORT: int = int(os.environ.get("RELAY_PORT", "9000"))
 MONITOR: int = 0
-SMOOTHING: float = 0.35   # EMA retention (lower = snappier, higher = smoother)
+SMOOTHING: float = 0.50   # EMA retention (lower = snappier, higher = smoother)
 SATURATION: float = 1.4   # OKLAB chroma boost (1.0 = raw, 1.4 = vibrant)
 GAMMA: float = 2.2        # LED gamma (sRGB standard; raise to 2.5 for dimmer mid-tones)
 BRIGHTNESS: int = 100     # LED brightness 0-100
 MIN_GLOW: int = 6         # below this, blend toward warm amber
-DELTA: float = 0.008      # min OKLAB dE to trigger a UDP send
-MAX_FPS: int = 30         # max UDP packets per second
+DELTA: float = 0.015      # min OKLAB dE to trigger a UDP send
+MAX_FPS: int = 20         # max UDP packets per second (matches BLE throughput)
 
 # -- OKLAB colour science ----------------------------------------------------
 #
@@ -190,7 +190,7 @@ class _ColorExtractor:
     _MAX_CONSECUTIVE_REJECTS = 10
 
     def __init__(self) -> None:
-        self._frame_buf: deque[np.ndarray] = deque(maxlen=4)
+        self._frame_buf: deque[np.ndarray] = deque(maxlen=6)
         self._reject_count = 0
 
     def extract(self, frame: np.ndarray, ds: int = 16) -> np.ndarray | None:
@@ -244,12 +244,12 @@ class _Smoother:
 
     __slots__ = ("_base_alpha", "_state", "_warm")
 
-    _SCENE_CUT = 0.40     # e.g. black -> red
+    _SCENE_CUT = 0.35     # scene change snap threshold (e.g. black -> red)
     _MEDIUM = 0.12        # noticeable shift
-    _DEADBAND = 0.015     # sub-perceptual noise
+    _DEADBAND = 0.025     # sub-perceptual noise, hold steady
 
-    _ALPHA_SNAP = 0.05    # near-instant for scene cuts
-    _ALPHA_MEDIUM = 0.15  # responsive for medium changes
+    _ALPHA_SNAP = 0.08    # near-instant for scene cuts (retains slight blend)
+    _ALPHA_MEDIUM = 0.25  # smooth medium transitions (~400 ms settle)
 
     def __init__(self, base_alpha: float = SMOOTHING) -> None:
         self._base_alpha = base_alpha
