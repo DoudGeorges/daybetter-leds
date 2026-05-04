@@ -42,13 +42,13 @@ if TYPE_CHECKING:
 RELAY_HOST: str = os.environ.get("RELAY_HOST", "192.168.2.122")
 RELAY_PORT: int = int(os.environ.get("RELAY_PORT", "9000"))
 MONITOR: int = 0
-SMOOTHING: float = 0.42   # EMA retention (lower = snappier, higher = smoother)
+SMOOTHING: float = 0.30   # EMA retention (lower = snappier, higher = smoother)
 SATURATION: float = 1.4   # OKLAB chroma boost (1.0 = raw, 1.4 = vibrant)
 GAMMA: float = 2.2        # LED gamma (sRGB standard; raise to 2.5 for dimmer mid-tones)
 BRIGHTNESS: int = 100     # LED brightness 0-100
 MIN_GLOW: int = 6         # below this, blend toward warm amber
-DELTA: float = 0.012      # min OKLAB dE to trigger a UDP send
-MAX_FPS: int = 25         # max UDP packets per second
+DELTA: float = 0.008      # min OKLAB dE to trigger a UDP send
+MAX_FPS: int = 30         # max UDP packets per second
 
 # -- OKLAB colour science ----------------------------------------------------
 #
@@ -190,7 +190,7 @@ class _ColorExtractor:
     _MAX_CONSECUTIVE_REJECTS = 10
 
     def __init__(self) -> None:
-        self._frame_buf: deque[np.ndarray] = deque(maxlen=5)
+        self._frame_buf: deque[np.ndarray] = deque(maxlen=3)
         self._reject_count = 0
 
     def extract(self, frame: np.ndarray, ds: int = 16) -> np.ndarray | None:
@@ -237,19 +237,26 @@ class _ColorExtractor:
 
 
 class _Smoother:
-    """Three-tier adaptive EMA with hysteresis deadband in OKLAB.
+    """Four-tier adaptive EMA with hysteresis deadband in OKLAB.
 
-    OKLAB ΔE lives on a 0-1 scale (black ↔ white ≈ 1.0).
+    Tiers (by OKLAB ΔE, 0-1 scale where black ↔ white ≈ 1.0):
+      >0.35  scene cut  → α=0.04  (96% new, near-instant snap)
+      >0.18  large      → α=0.12  (88% new, fast settle)
+      >0.08  medium     → α=0.20  (80% new, smooth transition)
+      >0.012 small      → α=0.30  (70% new, gentle drift)
+      <0.012 deadband   → hold    (suppress sub-perceptual noise)
     """
 
     __slots__ = ("_base_alpha", "_state", "_warm")
 
-    _SCENE_CUT = 0.37     # scene change snap threshold (e.g. black -> red)
-    _MEDIUM = 0.12        # noticeable shift
-    _DEADBAND = 0.020     # sub-perceptual noise, hold steady
+    _SCENE_CUT = 0.35     # scene change snap threshold (e.g. black -> red)
+    _LARGE = 0.18         # large but not scene-cut shift
+    _MEDIUM = 0.08        # noticeable shift
+    _DEADBAND = 0.012     # sub-perceptual noise, hold steady
 
-    _ALPHA_SNAP = 0.06    # near-instant for scene cuts
-    _ALPHA_MEDIUM = 0.20  # smooth medium transitions (~300 ms settle)
+    _ALPHA_SNAP = 0.04    # near-instant for scene cuts
+    _ALPHA_LARGE = 0.12   # fast settle for large shifts
+    _ALPHA_MEDIUM = 0.20  # moderate transitions (~250 ms settle)
 
     def __init__(self, base_alpha: float = SMOOTHING) -> None:
         self._base_alpha = base_alpha
@@ -270,6 +277,8 @@ class _Smoother:
 
         if dE > self._SCENE_CUT:
             alpha = self._ALPHA_SNAP
+        elif dE > self._LARGE:
+            alpha = self._ALPHA_LARGE
         elif dE > self._MEDIUM:
             alpha = self._ALPHA_MEDIUM
         else:
