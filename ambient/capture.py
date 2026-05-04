@@ -117,13 +117,10 @@ _DARK_GLOW = (8, 4, 1)  # warm amber ~2700K
 
 
 def _build_gamma_lut(gamma: float) -> np.ndarray:
-    """Hybrid gamma LUT with toe lift (0-20) for shadow preservation."""
+    """Power-curve gamma LUT for LED correction."""
     lut = np.zeros(256, dtype=np.uint8)
-    toe = 20
-    toe_g = gamma * 0.6
     for i in range(256):
-        x = i / 255.0
-        lut[i] = int(255.0 * x ** (toe_g if i <= toe else gamma) + 0.5)
+        lut[i] = int(255.0 * (i / 255.0) ** gamma + 0.5)
     return lut
 
 
