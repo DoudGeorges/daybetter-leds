@@ -1,9 +1,16 @@
-"""Screen ambient lighting (PC).
+"""Screen ambient lighting — PC side.
 
-Captures screen content, extracts a representative color, and sends
-it to the Raspberry Pi relay over UDP.
+Captures screen content, extracts a representative color in OKLAB
+perceptual color space, and streams it to the Raspberry Pi relay via UDP.
 
-    python ambient/capture.py
+Pipeline::
+
+    Screen -> downsample -> sRGB -> linear RGB -> OKLAB
+    -> luminance-weighted average -> temporal blend -> adaptive EMA
+    -> chroma boost -> brightness scale -> linear RGB -> LED gamma -> uint8
+
+OKLAB ensures that averaging, smoothing, and saturation adjustments are
+perceptually uniform — no muddy mid-tones or hue shifts.
 """
 
 from __future__ import annotations
@@ -18,202 +25,350 @@ import time
 import traceback
 from collections import deque
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import protocol  # noqa: E402 (triggers .env loading)
+# Importing ``protocol`` triggers .env loading as a side-effect.
+_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_root))
+import protocol as _protocol  # noqa: E402, F841
 
-# Configuration
+if TYPE_CHECKING:
+    from types import FrameType
+
+# -- Configuration -----------------------------------------------------------
 
 RELAY_HOST: str = os.environ.get("RELAY_HOST", "192.168.2.122")
 RELAY_PORT: int = int(os.environ.get("RELAY_PORT", "9000"))
-MONITOR: int = 0        # DXCam monitor index (0 = primary)
-SMOOTHING: float = 0.30 # EMA weight on previous frame (0.2 = gaming, 0.5 = cinema)
-SATURATION: float = 1.4 # Color vibrancy (1.0 = raw, 1.8 = oversaturated)
-GAMMA: float = 2.0      # Gamma curve for LEDs (lower = brighter shadows)
-BRIGHTNESS: int = 100   # LED brightness 0-100
-MIN_GLOW: int = 3       # Below this, use warm amber instead of off
-DELTA: float = 2.0      # RGB change needed to send an update
-MAX_FPS: int = 30       # UDP packets per second
+MONITOR: int = 0
+SMOOTHING: float = 0.35   # EMA retention (lower = snappier, higher = smoother)
+SATURATION: float = 1.4   # OKLAB chroma boost (1.0 = raw, 1.4 = vibrant)
+GAMMA: float = 2.2        # LED gamma (sRGB standard; raise to 2.5 for dimmer mid-tones)
+BRIGHTNESS: int = 100     # LED brightness 0-100
+MIN_GLOW: int = 6         # below this, blend toward warm amber
+DELTA: float = 0.008      # min OKLAB dE to trigger a UDP send
+MAX_FPS: int = 30         # max UDP packets per second
 
-# Screen capture
+# -- OKLAB colour science ----------------------------------------------------
+#
+# Reference: https://bottosson.github.io/posts/oklab/
+# All conversions are vectorised numpy, operating on (..., 3) arrays.
+
+# Matrices from Björn Ottosson (updated Jan 2021 precision).
+_M1 = np.array([
+    [0.4122214708, 0.5363325363, 0.0514459929],
+    [0.2119034982, 0.6806995451, 0.1073969566],
+    [0.0883024619, 0.2817188376, 0.6299787005],
+], dtype=np.float64)
+
+_M2 = np.array([
+    [0.2104542553, 0.7936177850, -0.0040720468],
+    [1.9779984951, -2.4285922050, 0.4505937099],
+    [0.0259040371, 0.7827717662, -0.8086757660],
+], dtype=np.float64)
+
+_M1_INV = np.array([
+    [1.0, 0.3963377774, 0.2158037573],
+    [1.0, -0.1055613458, -0.0638541728],
+    [1.0, -0.0894841775, -1.2914855480],
+], dtype=np.float64)
+
+_M2_INV = np.array([
+    [4.0767416621, -3.3077115913, 0.2309699292],
+    [-1.2684380046, 2.6097574011, -0.3413193965],
+    [-0.0041960863, -0.7034186147, 1.7076147010],
+], dtype=np.float64)
 
 
-def _create_camera(monitor: int = 0) -> tuple[object, str]:
+def srgb_to_linear(srgb: np.ndarray) -> np.ndarray:
+    """sRGB [0,1] -> linear RGB [0,1] via the IEC 61966-2-1 transfer."""
+    return np.where(
+        srgb <= 0.04045,
+        srgb / 12.92,
+        ((srgb + 0.055) / 1.055) ** 2.4,
+    )
+
+
+def linear_to_srgb(linear: np.ndarray) -> np.ndarray:
+    """Linear RGB [0,1] -> sRGB [0,1] via the IEC 61966-2-1 transfer."""
+    return np.where(
+        linear <= 0.0031308,
+        linear * 12.92,
+        1.055 * np.power(np.maximum(linear, 0.0), 1.0 / 2.4) - 0.055,
+    )
+
+
+def linear_rgb_to_oklab(rgb: np.ndarray) -> np.ndarray:
+    """Linear RGB (..., 3) -> OKLAB (..., 3)."""
+    lms = rgb @ _M1.T
+    lms_g = np.sign(lms) * np.abs(lms) ** (1.0 / 3.0)
+    return lms_g @ _M2.T
+
+
+def oklab_to_linear_rgb(lab: np.ndarray) -> np.ndarray:
+    """OKLAB (..., 3) -> linear RGB (..., 3)."""
+    lms_g = lab @ _M1_INV.T
+    return (lms_g ** 3) @ _M2_INV.T
+
+
+def srgb_to_oklab(srgb: np.ndarray) -> np.ndarray:
+    """sRGB [0,1] -> OKLAB (convenience wrapper)."""
+    return linear_rgb_to_oklab(srgb_to_linear(srgb))
+
+
+def oklab_to_srgb(lab: np.ndarray) -> np.ndarray:
+    """OKLAB -> sRGB [0,1], clipped to gamut."""
+    return np.clip(linear_to_srgb(oklab_to_linear_rgb(lab)), 0.0, 1.0)
+
+
+# -- Screen capture ----------------------------------------------------------
+
+
+def _create_camera(monitor: int = 0) -> tuple[object | None, str]:
+    """Try DXCam (GPU-accelerated), fall back to mss."""
     try:
         import dxcam
         cam = dxcam.create(output_idx=monitor, output_color="BGR")
-        cam.start(target_fps=30, video_mode=True)
+        cam.start(target_fps=MAX_FPS, video_mode=True)
         return cam, "dxcam"
     except Exception:
         return None, "mss"
 
 
 class _MSSFallback:
-    __slots__ = ("sct", "mon")
+    """Cross-platform GDI fallback when DXCam is unavailable."""
+
+    __slots__ = ("_sct", "_mon")
 
     def __init__(self, monitor: int = 1) -> None:
         import mss as _mss
-        self.sct = _mss.MSS()
-        self.mon = self.sct.monitors[monitor]
+        self._sct = _mss.MSS()
+        self._mon = self._sct.monitors[monitor]
 
-    def grab(self) -> np.ndarray:
-        shot = self.sct.grab(self.mon)
+    def grab(self) -> np.ndarray | None:
+        shot = self._sct.grab(self._mon)
+        if shot is None:
+            return None
         return np.frombuffer(shot.raw, dtype=np.uint8).reshape(
             shot.height, shot.width, 4,
         )[:, :, :3]
 
 
-# Color extraction
+# -- Colour extraction -------------------------------------------------------
 
-_LUMA_R, _LUMA_G, _LUMA_B = 0.2126, 0.7152, 0.0722  # BT.709
+# BT.709 luma coefficients for luminance weighting in linear space.
+_LUMA_R, _LUMA_G, _LUMA_B = 0.2126, 0.7152, 0.0722
+
 _edge_cache: dict[tuple[int, int], np.ndarray] = {}
 
 
 def _build_edge_gradient(h: int, w: int) -> np.ndarray:
-    """Cosine-falloff edge weight map: 3x at edges, 1x at center."""
+    """Cosine-falloff weight map: 3x at edges, 1x at centre."""
     key = (h, w)
     if key in _edge_cache:
         return _edge_cache[key]
     y = np.arange(h, dtype=np.float32)
     x = np.arange(w, dtype=np.float32)
-    dy = np.minimum(y, h - 1 - y) / (h * 0.5)
-    dx = np.minimum(x, w - 1 - x) / (w * 0.5)
+    dy = np.minimum(y, h - 1 - y) / max(h * 0.5, 1)
+    dx = np.minimum(x, w - 1 - x) / max(w * 0.5, 1)
     dist = np.minimum(dy[:, None], dx[None, :])
     wm = 1.0 + 2.0 * (0.5 * (1.0 + np.cos(np.clip(dist, 0, 1) * np.pi)))
     _edge_cache[key] = wm
     return wm
 
 
-_frame_buf: deque[np.ndarray] = deque(maxlen=3)
+class _ColorExtractor:
+    """Stateful per-frame colour extraction in OKLAB space.
 
+    Encapsulates the temporal frame buffer and anomaly rejection counter
+    so the module carries no mutable global state.
+    """
 
-def _extract_color(frame: np.ndarray, ds: int = 16) -> np.ndarray:
-    """Downsample, temporal average, edge + luminance weighting."""
-    small = frame[::ds, ::ds].astype(np.float32)
-    h, w = small.shape[:2]
-    _frame_buf.append(small)
-    if len(_frame_buf) > 1:
-        small = np.mean(np.stack(_frame_buf), axis=0)
-    b_ch, g_ch, r_ch = small[:, :, 0], small[:, :, 1], small[:, :, 2]
-    luma = _LUMA_R * r_ch + _LUMA_G * g_ch + _LUMA_B * b_ch
-    luma_w = (luma / 255.0) ** 0.5 + 0.08
-    spatial = _build_edge_gradient(h, w)
-    weight = luma_w * spatial
-    total = weight.sum()
-    if total < 1e-6:
-        return np.zeros(3, dtype=np.float32)
-    return np.array([
-        (r_ch * weight).sum() / total,
-        (g_ch * weight).sum() / total,
-        (b_ch * weight).sum() / total,
-    ], dtype=np.float32)
+    __slots__ = ("_frame_buf", "_reject_count")
 
-
-# Color pipeline
-
-_DARK_GLOW = (8, 4, 1)  # warm amber ~2700K
-
-
-def _build_gamma_lut(gamma: float) -> np.ndarray:
-    """Power-curve gamma LUT for LED correction."""
-    lut = np.zeros(256, dtype=np.uint8)
-    for i in range(256):
-        lut[i] = int(255.0 * (i / 255.0) ** gamma + 0.5)
-    return lut
-
-
-class _Pipeline:
-    __slots__ = ("sat", "bri", "lut", "floor")
+    _MAX_CONSECUTIVE_REJECTS = 10
 
     def __init__(self) -> None:
-        self.sat = SATURATION
-        self.bri = BRIGHTNESS / 100.0
-        self.lut = _build_gamma_lut(GAMMA)
-        self.floor = MIN_GLOW
+        self._frame_buf: deque[np.ndarray] = deque(maxlen=4)
+        self._reject_count = 0
 
-    def apply(self, rgb: np.ndarray) -> tuple[int, int, int]:
-        r, g, b = float(rgb[0]), float(rgb[1]), float(rgb[2])
-        if self.sat != 1.0:
-            m = (r + g + b) / 3.0
-            r = m + (r - m) * self.sat
-            g = m + (g - m) * self.sat
-            b = m + (b - m) * self.sat
-        r *= self.bri
-        g *= self.bri
-        b *= self.bri
-        ri = int(self.lut[max(0, min(255, int(r + 0.5)))])
-        gi = int(self.lut[max(0, min(255, int(g + 0.5)))])
-        bi = int(self.lut[max(0, min(255, int(b + 0.5)))])
-        if self.floor > 0 and max(ri, gi, bi) < self.floor:
-            ri, gi, bi = _DARK_GLOW
-        return ri, gi, bi
+    def extract(self, frame: np.ndarray, ds: int = 16) -> np.ndarray | None:
+        """Return the dominant OKLAB (L, a, b) vector, or *None* on reject."""
+        small = frame[::ds, ::ds].astype(np.float64) / 255.0
+        h, w = small.shape[:2]
+
+        mean_brightness = small.mean() * 255.0
+        if mean_brightness > 250.0 or mean_brightness < 2.0:
+            self._reject_count += 1
+            if self._reject_count < self._MAX_CONSECUTIVE_REJECTS:
+                return None
+            # Accept after too many consecutive rejects (actual content).
+        else:
+            self._reject_count = 0
+
+        rgb_srgb = small[:, :, ::-1].copy()  # BGR -> RGB
+        rgb_linear = srgb_to_linear(rgb_srgb)
+        oklab = linear_rgb_to_oklab(rgb_linear)
+
+        luma = (rgb_linear[:, :, 0] * _LUMA_R
+                + rgb_linear[:, :, 1] * _LUMA_G
+                + rgb_linear[:, :, 2] * _LUMA_B)
+        luma_w = luma + 0.02
+
+        spatial = _build_edge_gradient(h, w)
+        weight = luma_w * spatial
+
+        self._frame_buf.append(oklab)
+        if len(self._frame_buf) > 1:
+            oklab = np.mean(np.stack(self._frame_buf), axis=0)
+
+        total = weight.sum()
+        if total < 1e-9:
+            return np.zeros(3, dtype=np.float64)
+
+        ch_L = (oklab[:, :, 0] * weight).sum() / total
+        ch_a = (oklab[:, :, 1] * weight).sum() / total
+        ch_b = (oklab[:, :, 2] * weight).sum() / total
+        return np.array([ch_L, ch_a, ch_b], dtype=np.float64)
 
 
-# Adaptive EMA smoother
+# -- Adaptive EMA smoother ---------------------------------------------------
 
 
 class _Smoother:
-    """Snap on scene cuts, smooth on gradual shifts."""
+    """Three-tier adaptive EMA with hysteresis deadband in OKLAB.
 
-    __slots__ = ("base", "snap", "state", "warm")
+    OKLAB ΔE lives on a 0-1 scale (black ↔ white ≈ 1.0).
+    """
 
-    def __init__(self) -> None:
-        self.base = SMOOTHING
-        self.snap = 50.0
-        self.state = np.zeros(3, dtype=np.float64)
-        self.warm = False
+    __slots__ = ("_base_alpha", "_state", "_warm")
 
-    def step(self, rgb: np.ndarray) -> np.ndarray:
-        if not self.warm:
-            self.state[:] = rgb
-            self.warm = True
-            return self.state.copy()
-        d = float(np.linalg.norm(rgb - self.state))
-        if d > self.snap:
-            a = 0.03
-        elif d > self.snap * 0.35:
-            a = self.base * 0.25
+    _SCENE_CUT = 0.40     # e.g. black -> red
+    _MEDIUM = 0.12        # noticeable shift
+    _DEADBAND = 0.015     # sub-perceptual noise
+
+    _ALPHA_SNAP = 0.05    # near-instant for scene cuts
+    _ALPHA_MEDIUM = 0.15  # responsive for medium changes
+
+    def __init__(self, base_alpha: float = SMOOTHING) -> None:
+        self._base_alpha = base_alpha
+        self._state = np.zeros(3, dtype=np.float64)
+        self._warm = False
+
+    def step(self, lab: np.ndarray) -> np.ndarray:
+        """Return the smoothed OKLAB vector for this frame."""
+        if not self._warm:
+            self._state[:] = lab
+            self._warm = True
+            return self._state.copy()
+
+        dE = float(np.linalg.norm(lab - self._state))
+
+        if dE < self._DEADBAND:
+            return self._state.copy()
+
+        if dE > self._SCENE_CUT:
+            alpha = self._ALPHA_SNAP
+        elif dE > self._MEDIUM:
+            alpha = self._ALPHA_MEDIUM
         else:
-            a = self.base
-        self.state = self.state * a + rgb * (1.0 - a)
-        return self.state.copy()
+            alpha = self._base_alpha
+
+        self._state = self._state * alpha + lab * (1.0 - alpha)
+        return self._state.copy()
 
 
-# UDP sender
+# -- Colour pipeline ---------------------------------------------------------
+
+# Warm amber fallback for dark scenes (approximate 2700 K).
+_DARK_GLOW = np.array([10.0, 5.0, 2.0], dtype=np.float64)
+
+
+def _build_gamma_lut(gamma: float) -> np.ndarray:
+    """Pre-compute a 256-entry power-curve LUT for LED gamma correction."""
+    idx = np.arange(256, dtype=np.float64) / 255.0
+    return (255.0 * idx ** gamma + 0.5).astype(np.uint8)
+
+
+class _Pipeline:
+    """OKLAB -> final ``(R, G, B)`` uint8 for LED output.
+
+    1. Chroma boost (scale *a*, *b* — hue-preserving by definition)
+    2. Brightness scaling (scale *L*)
+    3. OKLAB -> linear RGB -> sRGB
+    4. LED gamma LUT
+    5. Dark-scene floor: proportional blend toward warm amber
+    """
+
+    __slots__ = ("_sat", "_bri", "_lut", "_floor")
+
+    def __init__(
+        self,
+        saturation: float = SATURATION,
+        brightness: int = BRIGHTNESS,
+        gamma: float = GAMMA,
+        min_glow: int = MIN_GLOW,
+    ) -> None:
+        self._sat = saturation
+        self._bri = brightness / 100.0
+        self._lut = _build_gamma_lut(gamma)
+        self._floor = min_glow
+
+    def apply(self, lab: np.ndarray) -> tuple[int, int, int]:
+        L = float(lab[0]) * self._bri
+        a = float(lab[1]) * self._sat
+        b = float(lab[2]) * self._sat
+
+        srgb = oklab_to_srgb(np.array([L, a, b], dtype=np.float64))
+
+        ri = int(self._lut[min(max(int(srgb[0] * 255.0 + 0.5), 0), 255)])
+        gi = int(self._lut[min(max(int(srgb[1] * 255.0 + 0.5), 0), 255)])
+        bi = int(self._lut[min(max(int(srgb[2] * 255.0 + 0.5), 0), 255)])
+
+        peak = max(ri, gi, bi)
+        if self._floor > 0 and peak < self._floor:
+            t = peak / self._floor
+            ri = int(_DARK_GLOW[0] * (1.0 - t) + ri * t + 0.5)
+            gi = int(_DARK_GLOW[1] * (1.0 - t) + gi * t + 0.5)
+            bi = int(_DARK_GLOW[2] * (1.0 - t) + bi * t + 0.5)
+
+        return (ri, gi, bi)
+
+
+# -- UDP sender ---------------------------------------------------------------
 
 _MAGIC = 0xDB
 _CMD_COLOR = 0x01
 
 
 class _UDPSender:
-    __slots__ = ("addr", "sock")
+    __slots__ = ("_addr", "_sock")
 
-    def __init__(self) -> None:
-        self.addr = (RELAY_HOST, RELAY_PORT)
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setblocking(False)
+    def __init__(self, host: str = RELAY_HOST, port: int = RELAY_PORT) -> None:
+        self._addr = (host, port)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setblocking(False)
 
     def send(self, r: int, g: int, b: int) -> None:
         try:
-            self.sock.sendto(
+            self._sock.sendto(
                 struct.pack("BBBBBBB", _MAGIC, _CMD_COLOR, r, g, b, 0, 0),
-                self.addr,
+                self._addr,
             )
-        except BlockingIOError:
+        except OSError:
             pass
 
     def close(self) -> None:
-        self.sock.close()
+        self._sock.close()
 
 
-# Main loop
+# -- Main loop ----------------------------------------------------------------
 
 _shutdown = asyncio.Event()
 
 
-def _on_signal(*_: object) -> None:
+def _on_signal(_signum: int, _frame: FrameType | None) -> None:
     _shutdown.set()
 
 
@@ -231,12 +386,14 @@ async def main() -> None:
     else:
         print("  Capture: DXCam")
 
+    extractor = _ColorExtractor()
     pipe = _Pipeline()
     smooth = _Smoother()
+
     interval = 1.0 / MAX_FPS
     delta_sq = DELTA ** 2
 
-    last_sent = (0, 0, 0)
+    last_lab = np.zeros(3, dtype=np.float64)
     last_t = 0.0
     writes = 0
     frames = 0
@@ -245,7 +402,10 @@ async def main() -> None:
 
     print(f"  smooth={SMOOTHING}  sat={SATURATION}  gamma={GAMMA}  "
           f"bri={BRIGHTNESS}%  glow={MIN_GLOW}  fps={MAX_FPS}")
+    print("  Pipeline: sRGB -> OKLAB -> smooth -> boost -> LED gamma")
     print("  Ctrl+C to stop\n")
+
+    out = (0, 0, 0)
 
     try:
         while not _shutdown.is_set():
@@ -253,29 +413,29 @@ async def main() -> None:
 
             if cam is not None:
                 frame = cam.get_latest_frame()
-                if frame is None:
-                    await asyncio.sleep(0.005)
-                    continue
             else:
+                assert mss_fb is not None
                 frame = mss_fb.grab()
 
-            # Reject DXCam recovery glitches (near-white frames)
-            if frame[::32, ::32, :3].mean() > 245:
+            if frame is None:
                 await asyncio.sleep(0.005)
                 continue
 
-            raw = _extract_color(frame)
-            smoothed = smooth.step(raw)
-            out = pipe.apply(smoothed)
+            raw_lab = extractor.extract(frame)
+            if raw_lab is None:
+                await asyncio.sleep(0.005)
+                continue
+
+            smoothed_lab = smooth.step(raw_lab)
+            out = pipe.apply(smoothed_lab)
 
             now = time.perf_counter()
-            dr = out[0] - last_sent[0]
-            dg = out[1] - last_sent[1]
-            db = out[2] - last_sent[2]
+            diff = smoothed_lab - last_lab
+            dE_sq = float(diff[0] ** 2 + diff[1] ** 2 + diff[2] ** 2)
 
-            if (dr * dr + dg * dg + db * db) > delta_sq and (now - last_t) >= interval:
-                udp.send(out[0], out[1], out[2])
-                last_sent = out
+            if dE_sq > delta_sq and (now - last_t) >= interval:
+                udp.send(*out)
+                last_lab[:] = smoothed_lab
                 last_t = now
                 writes += 1
 
@@ -290,20 +450,18 @@ async def main() -> None:
                 wps = writes / max(elapsed, 0.001)
                 print(
                     f"\r  ({out[0]:3d},{out[1]:3d},{out[2]:3d})"
-                    f"  {1000 / avg_ms:4.0f}fps  {avg_ms:4.1f}ms"
+                    f"  {1000 / max(avg_ms, 0.1):4.0f}fps  {avg_ms:4.1f}ms"
                     f"  {wps:4.1f}w/s  w={writes}  {elapsed:.0f}s",
                     end="", flush=True,
                 )
 
-    except Exception as e:
-        print(f"\nError: {e}")
+    except Exception as exc:
+        print(f"\nError: {exc}")
         traceback.print_exc()
     finally:
         elapsed = time.perf_counter() - t_start
         wps = writes / max(elapsed, 0.001)
         print(f"\n\n  {writes} writes / {elapsed:.0f}s = {wps:.1f} writes/sec")
-        udp.send(10, 5, 15)
-        await asyncio.sleep(0.3)
         udp.close()
         if cam is not None:
             cam.stop()

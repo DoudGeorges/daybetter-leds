@@ -1,6 +1,6 @@
 """DayBetter BLE protocol.
 
-Packet format, CRC-16, GATT profiles, and CCHIP handshake constants.
+Packet format, CRC-16, GATT profiles, and handshake constants.
 For the full protocol reference, see PROTOCOL.md.
 """
 
@@ -11,18 +11,14 @@ from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 
-# Load .env from project root
 _ROOT = Path(__file__).resolve().parent
 _ENV = _ROOT / ".env"
 if _ENV.exists():
-    for _line in _ENV.read_text().splitlines():
+    for _line in _ENV.read_text(encoding="utf-8").splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _, _v = _line.partition("=")
             os.environ.setdefault(_k.strip(), _v.strip())
-
-
-# CRC-16/MODBUS lookup table (polynomial 0xA001)
 
 _CRC16_TABLE: tuple[int, ...] = (
     0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241,
@@ -60,8 +56,8 @@ _CRC16_TABLE: tuple[int, ...] = (
 )
 
 
-def crc16_modbus(data: bytes) -> int:
-    """CRC-16/MODBUS over the given bytes."""
+def crc16_modbus(data: bytes | bytearray) -> int:
+    """CRC-16/MODBUS over *data*."""
     crc = 0xFFFF
     for b in data:
         crc = (crc >> 8) ^ _CRC16_TABLE[(crc ^ b) & 0xFF]
@@ -72,7 +68,7 @@ _HEADER = 0xA0
 
 
 def build_packet(cmd: int, payload: bytes = b"") -> bytes:
-    """Build a BLE write packet: [0xA0][cmd][len][payload...][crc_lo][crc_hi]."""
+    """Build a BLE write packet: ``[0xA0][cmd][len][payload…][crc16]``."""
     length = len(payload) + 3
     buf = bytearray([_HEADER, cmd & 0xFF, length & 0xFF]) + bytearray(payload)
     crc = crc16_modbus(buf)
@@ -82,11 +78,14 @@ def build_packet(cmd: int, payload: bytes = b"") -> bytes:
 
 
 class Cmd(IntEnum):
+    """BLE command IDs used by both QC and HC device families."""
+
     HC_SET_COLOR = 0x04
     POWER = 0x11
     SET_MODE = 0x12
     BRIGHTNESS = 0x13
     QC_SET_COLOR = 0x15
+    SPEED = 0x16
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,15 +141,3 @@ PROFILES: dict[str, DeviceProfile] = {
     "P036": DeviceProfile("Magic Light", "E036", "A036", "F036", "C036", 2),
     "P044": DeviceProfile("Magic Light", "E044", "A044", "F044", "C044", 2),
 }
-
-# CCHIP handshake lookup table: ASCII 0-9, A-Z, a-z (62 entries)
-CCHIP_TABLE: tuple[int, ...] = (
-    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
-    0x38, 0x39, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46,
-    0x47, 0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E,
-    0x4F, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56,
-    0x57, 0x58, 0x59, 0x5A, 0x61, 0x62, 0x63, 0x64,
-    0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C,
-    0x6D, 0x6E, 0x6F, 0x70, 0x71, 0x72, 0x73, 0x74,
-    0x75, 0x76, 0x77, 0x78, 0x79, 0x7A,
-)

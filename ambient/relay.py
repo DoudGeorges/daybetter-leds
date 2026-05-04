@@ -1,9 +1,7 @@
-"""BLE relay daemon (Raspberry Pi).
+"""BLE relay daemon — Raspberry Pi side.
 
-Maintains a persistent BLE connection and forwards UDP color commands
-from capture.py to the LED strip.
-
-    python ambient/relay.py
+Maintains a persistent BLE connection and forwards UDP colour commands
+from ``capture.py`` to the LED strip.
 """
 
 from __future__ import annotations
@@ -14,134 +12,202 @@ import os
 import struct
 import sys
 import time
+from enum import IntEnum
 from pathlib import Path
 
 from bleak import BleakClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from protocol import Cmd, PROFILES, build_packet
+from protocol import Cmd, PROFILES, build_packet  # noqa: E402
 
-# Configuration
+# -- Configuration -----------------------------------------------------------
 
-ADDRESS: str = os.environ.get("BLE_ADDRESS", "80:AC:C8:62:62:09")
+ADDRESS: str = os.environ.get("BLE_ADDRESS", "AA:BB:CC:DD:EE:FF")
 PROFILE: str = os.environ.get("BLE_PROFILE", "P031")
 HOST: str = "0.0.0.0"
 PORT: int = int(os.environ.get("RELAY_PORT", "9000"))
 
-# UDP command IDs
+_MIN_WRITE_INTERVAL: float = 0.025  # 25 ms → 40 Hz BLE cap
 
 log = logging.getLogger("relay")
 
-_MAGIC = 0xDB
-_CMD_COLOR = 0x01
-_CMD_MODE = 0x02
-_CMD_BRIGHTNESS = 0x03
-_CMD_ON = 0x04
-_CMD_OFF = 0x05
-_CMD_HANDSHAKE = 0x06
-_CMD_PING = 0xFF
 
-# BLE connection with auto-reconnect
+class UDPCmd(IntEnum):
+    """Wire IDs for the PC-to-Pi UDP micro-protocol."""
+
+    COLOR = 0x01
+    MODE = 0x02
+    BRIGHTNESS = 0x03
+    ON = 0x04
+    OFF = 0x05
+    HANDSHAKE = 0x06
+    PING = 0xFF
+
+
+_MAGIC = 0xDB
+
+# -- BLE relay ---------------------------------------------------------------
 
 
 class _BLERelay:
+    """Persistent BLE connection with auto-reconnect and write coalescing."""
+
     __slots__ = (
-        "address", "profile", "client", "connected",
+        "_address", "_profile", "_client", "_connected",
         "_notify_data", "_notify_event", "_lock",
-        "_write_count", "_total_latency",
+        "_write_count", "_total_latency", "_last_write_t",
     )
 
     _MAX_RECONNECT = 5
+    _HANDSHAKE_RETRIES = 3
 
-    def __init__(self) -> None:
-        self.address = ADDRESS
-        if PROFILE not in PROFILES:
-            raise ValueError(f"Unknown profile {PROFILE!r}. Valid: {', '.join(sorted(PROFILES))}")
-        self.profile = PROFILES[PROFILE]
-        self.client: BleakClient | None = None
-        self.connected = False
+    def __init__(self, address: str, profile_id: str) -> None:
+        self._address = address
+        if profile_id not in PROFILES:
+            valid = ", ".join(sorted(PROFILES))
+            raise ValueError(f"Unknown profile {profile_id!r}. Valid: {valid}")
+        self._profile = PROFILES[profile_id]
+        self._client: BleakClient | None = None
+        self._connected = False
         self._notify_data = bytearray()
         self._notify_event = asyncio.Event()
         self._lock = asyncio.Lock()
         self._write_count = 0
         self._total_latency = 0.0
+        self._last_write_t = 0.0
 
-    def _on_notify(self, _sender: int, data: bytearray) -> None:
+    def _on_notify(self, _characteristic: object, data: bytearray) -> None:
         self._notify_data = data
         self._notify_event.set()
 
-    async def connect(self) -> None:
-        log.info("Connecting to %s...", self.address)
-        self.client = BleakClient(self.address)
-        await self.client.connect()
-        await self.client.start_notify(
-            self.profile.notify_uuid, self._on_notify,
-        )
-        self.connected = True
-        log.info("Connected. Handshake...")
-        await self.handshake()
+    @property
+    def connected(self) -> bool:
+        return self._connected
 
-    async def handshake(self) -> None:
-        """CCHIP challenge-response (required before commands)."""
-        if self.client is None:
+    @property
+    def client(self) -> BleakClient | None:
+        return self._client
+
+    @property
+    def avg_latency_ms(self) -> float:
+        if self._write_count == 0:
+            return 0.0
+        return (self._total_latency / self._write_count) * 1000.0
+
+    # -- Connection ----------------------------------------------------------
+
+    async def connect(self) -> None:
+        log.info("Connecting to %s …", self._address)
+        self._client = BleakClient(self._address)
+        await self._client.connect()
+        await self._client.start_notify(
+            self._profile.notify_uuid, self._on_notify,
+        )
+        self._connected = True
+        log.info("Connected. Starting handshake …")
+
+        last_exc: Exception | None = None
+        for attempt in range(1, self._HANDSHAKE_RETRIES + 1):
+            try:
+                await self._handshake()
+                return
+            except Exception as exc:
+                last_exc = exc
+                log.warning(
+                    "Handshake attempt %d/%d failed: %s",
+                    attempt, self._HANDSHAKE_RETRIES, exc,
+                )
+                if attempt < self._HANDSHAKE_RETRIES:
+                    await asyncio.sleep(0.5)
+
+        raise RuntimeError(
+            f"Handshake failed after {self._HANDSHAKE_RETRIES} attempts",
+        ) from last_exc
+
+    async def _handshake(self) -> None:
+        """CCHIP challenge-response required before the device accepts commands."""
+        if self._client is None:
             raise RuntimeError("Not connected")
 
         cchip = b"CCHIP"
-        uuid = self.profile.write_uuid
+        uuid = self._profile.write_uuid
 
-        # Phase 1: request challenge
+        # Phase 1 — request challenge
         self._notify_event.clear()
-        await self.client.write_gatt_char(
+        await self._client.write_gatt_char(
             uuid, build_packet(0x00, cchip), response=True,
         )
         await asyncio.wait_for(self._notify_event.wait(), timeout=3.0)
 
         rx = self._notify_data
         if len(rx) < 10 or rx[3:8] != cchip:
-            raise RuntimeError(f"Handshake phase 1 failed: {rx.hex()}")
+            raise RuntimeError(f"Phase 1 failed: {rx.hex()}")
 
-        c1, c2 = rx[8], rx[9]
-        r1 = c1 ^ 36
-        r2 = c2 ^ 76
+        r1 = rx[8] ^ 36
+        r2 = rx[9] ^ 76
 
-        # Phase 2: send response
+        # Phase 2 — send response
         self._notify_event.clear()
-        await self.client.write_gatt_char(
+        await self._client.write_gatt_char(
             uuid, build_packet(0x01, cchip + bytes([r1, r2])), response=True,
         )
         await asyncio.wait_for(self._notify_event.wait(), timeout=3.0)
 
         rx2 = self._notify_data
         if len(rx2) < 9 or rx2[8] != 0x00:
-            raise RuntimeError(f"Handshake phase 2 failed: {rx2.hex()}")
+            raise RuntimeError(f"Phase 2 failed: {rx2.hex()}")
 
         log.info("Handshake OK")
-        await self.write(build_packet(Cmd.SET_MODE, b"\x01\x00"))
+        await self._write_raw(
+            build_packet(Cmd.SET_MODE, b"\x01\x00"), response=True,
+        )
         await asyncio.sleep(0.05)
 
-    async def write(self, data: bytes) -> None:
-        """Write to the BLE characteristic with latency tracking."""
-        if self.client is None:
+    # -- Writes --------------------------------------------------------------
+
+    async def _write_raw(self, data: bytes, *, response: bool = False) -> None:
+        if self._client is None:
             raise RuntimeError("Not connected")
+        t0 = time.perf_counter()
+        await self._client.write_gatt_char(
+            self._profile.write_uuid, data, response=response,
+        )
+        self._write_count += 1
+        self._total_latency += time.perf_counter() - t0
+
+    async def write_color(self, r: int, g: int, b: int, w: int = 0) -> None:
+        """Fire-and-forget colour update with minimum-interval coalescing."""
+        async with self._lock:
+            elapsed = time.perf_counter() - self._last_write_t
+            if elapsed < _MIN_WRITE_INTERVAL:
+                await asyncio.sleep(_MIN_WRITE_INTERVAL - elapsed)
+            try:
+                await self._write_raw(
+                    build_packet(Cmd.QC_SET_COLOR, bytes([r, g, b, w])),
+                )
+                self._last_write_t = time.perf_counter()
+            except Exception as exc:
+                log.warning("Colour write failed: %s — reconnecting", exc)
+                self._connected = False
+                await self._reconnect()
+
+    async def write_cmd(self, data: bytes) -> None:
+        """Acknowledged write for non-colour commands."""
         async with self._lock:
             try:
-                t0 = time.perf_counter()
-                await self.client.write_gatt_char(
-                    self.profile.write_uuid, data, response=True,
-                )
-                self._write_count += 1
-                self._total_latency += time.perf_counter() - t0
+                await self._write_raw(data, response=True)
             except Exception as exc:
-                log.warning("Write failed: %s. Reconnecting...", exc)
-                self.connected = False
+                log.warning("Command write failed: %s — reconnecting", exc)
+                self._connected = False
                 await self._reconnect()
 
     async def _reconnect(self) -> None:
         for attempt in range(self._MAX_RECONNECT):
+            delay = min(2 ** attempt, 10)
             try:
-                if self.client:
+                if self._client is not None:
                     try:
-                        await self.client.disconnect()
+                        await self._client.disconnect()
                     except Exception:
                         pass
                 await self.connect()
@@ -151,26 +217,21 @@ class _BLERelay:
                     "Reconnect %d/%d failed: %s",
                     attempt + 1, self._MAX_RECONNECT, exc,
                 )
-                await asyncio.sleep(1)
-        log.error("Failed after %d attempts.", self._MAX_RECONNECT)
-
-    @property
-    def avg_latency_ms(self) -> float:
-        if self._write_count == 0:
-            return 0.0
-        return (self._total_latency / self._write_count) * 1000
+                await asyncio.sleep(delay)
+        log.error("Giving up after %d reconnect attempts.", self._MAX_RECONNECT)
 
 
-# UDP server
+# -- UDP server ---------------------------------------------------------------
 
 
 class _Server:
-    __slots__ = ("ble", "_writes", "_start")
+    __slots__ = ("_ble", "_writes", "_start", "_pending")
 
     def __init__(self, ble: _BLERelay) -> None:
-        self.ble = ble
+        self._ble = ble
         self._writes = 0
         self._start = time.perf_counter()
+        self._pending: tuple[int, int, int, int] | None = None
 
     async def start(self) -> asyncio.DatagramTransport:
         loop = asyncio.get_running_loop()
@@ -179,7 +240,27 @@ class _Server:
             local_addr=(HOST, PORT),
         )
         log.info("UDP listening on %s:%d", HOST, PORT)
+        asyncio.create_task(self._colour_loop())
         return transport
+
+    async def _colour_loop(self) -> None:
+        """Drain the latest pending colour at BLE speed, dropping stale."""
+        while True:
+            if self._pending is not None:
+                r, g, b, w = self._pending
+                self._pending = None
+                await self._ble.write_color(r, g, b, w)
+                self._writes += 1
+                if self._writes % 100 == 0:
+                    elapsed = time.perf_counter() - self._start
+                    log.info(
+                        "%d writes | %.1f/s | BLE avg %.1fms",
+                        self._writes,
+                        self._writes / max(elapsed, 0.001),
+                        self._ble.avg_latency_ms,
+                    )
+            else:
+                await asyncio.sleep(0.005)
 
     async def handle(
         self,
@@ -193,52 +274,42 @@ class _Server:
         cmd = data[1]
         r, g, b, w = data[2], data[3], data[4], data[5]
 
-        if cmd == _CMD_COLOR:
-            await self.ble.write(
-                build_packet(Cmd.QC_SET_COLOR, bytes([r, g, b, w])),
-            )
-            self._writes += 1
-        elif cmd == _CMD_MODE:
-            await self.ble.write(build_packet(Cmd.SET_MODE, bytes([r, g])))
-        elif cmd == _CMD_BRIGHTNESS:
-            await self.ble.write(build_packet(Cmd.BRIGHTNESS, bytes([r])))
-        elif cmd == _CMD_ON:
-            await self.ble.write(build_packet(Cmd.SET_MODE, b"\x01\x00"))
-        elif cmd == _CMD_OFF:
-            await self.ble.write(build_packet(Cmd.POWER, b"\x00"))
-        elif cmd == _CMD_HANDSHAKE:
-            await self.ble.handshake()
-        elif cmd == _CMD_PING:
-            lat = int(self.ble.avg_latency_ms * 10)
+        if cmd == UDPCmd.COLOR:
+            self._pending = (r, g, b, w)
+        elif cmd == UDPCmd.MODE:
+            await self._ble.write_cmd(build_packet(Cmd.SET_MODE, bytes([r, g])))
+        elif cmd == UDPCmd.BRIGHTNESS:
+            await self._ble.write_cmd(build_packet(Cmd.BRIGHTNESS, bytes([r])))
+        elif cmd == UDPCmd.ON:
+            await self._ble.write_cmd(build_packet(Cmd.SET_MODE, b"\x01\x00"))
+        elif cmd == UDPCmd.OFF:
+            await self._ble.write_cmd(build_packet(Cmd.POWER, b"\x00"))
+        elif cmd == UDPCmd.HANDSHAKE:
+            await self._ble.connect()
+        elif cmd == UDPCmd.PING:
+            lat = int(self._ble.avg_latency_ms * 10)
             transport.sendto(
                 struct.pack("!BHI", _MAGIC, lat, self._writes), addr,
             )
 
-        if self._writes > 0 and self._writes % 100 == 0:
-            elapsed = time.perf_counter() - self._start
-            log.info(
-                "%d writes | %.1f/s | BLE avg %.1fms",
-                self._writes, self._writes / elapsed, self.ble.avg_latency_ms,
-            )
-
 
 class _Protocol(asyncio.DatagramProtocol):
-    __slots__ = ("server", "transport")
+    __slots__ = ("_server", "_transport")
 
     def __init__(self, server: _Server) -> None:
-        self.server = server
-        self.transport: asyncio.DatagramTransport | None = None
+        self._server = server
+        self._transport: asyncio.DatagramTransport | None = None
 
-    def connection_made(self, transport: asyncio.DatagramTransport) -> None:
-        self.transport = transport
+    def connection_made(self, transport: asyncio.DatagramTransport) -> None:  # type: ignore[override]
+        self._transport = transport
 
     def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        if self.transport is None:
+        if self._transport is None:
             return
-        asyncio.create_task(self.server.handle(data, addr, self.transport))
+        asyncio.create_task(self._server.handle(data, addr, self._transport))
 
 
-# Main loop
+# -- Entry point --------------------------------------------------------------
 
 
 async def main() -> None:
@@ -248,7 +319,7 @@ async def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    ble = _BLERelay()
+    ble = _BLERelay(ADDRESS, PROFILE)
     await ble.connect()
 
     server = _Server(ble)
@@ -262,10 +333,10 @@ async def main() -> None:
         while True:
             await asyncio.sleep(3600)
     except KeyboardInterrupt:
-        log.info("Shutting down...")
+        log.info("Shutting down …")
     finally:
         transport.close()
-        if ble.client:
+        if ble.client is not None:
             await ble.client.disconnect()
         log.info("Done.")
 
