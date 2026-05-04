@@ -198,6 +198,8 @@ class _Server:
                 build_packet(Cmd.QC_SET_COLOR, bytes([r, g, b, w])),
             )
             self._writes += 1
+            if self._writes <= 3:
+                log.info("  color (%d, %d, %d) from %s", r, g, b, addr[0])
         elif cmd == _CMD_MODE:
             await self.ble.write(build_packet(Cmd.SET_MODE, bytes([r, g])))
         elif cmd == _CMD_BRIGHTNESS:
