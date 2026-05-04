@@ -21,17 +21,19 @@ from bleak import BleakClient
 if TYPE_CHECKING:
     from bleak import BleakGATTCharacteristic
 
+# Sibling import — the project is not installed as a package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from protocol import Cmd, DeviceProfile, PROFILES, build_packet  # noqa: E402
+from protocol import Cmd, PROFILES, build_packet  # noqa: E402
 
 __all__: list[str] = []
 
 ADDRESS: str = os.environ.get("BLE_ADDRESS", "AA:BB:CC:DD:EE:FF")
 PROFILE: str = os.environ.get("BLE_PROFILE", "P031")
-HOST: str = "0.0.0.0"
+HOST: str = "0.0.0.0"  # Bind to all interfaces for LAN accessibility.
 PORT: int = int(os.environ.get("RELAY_PORT", "9000"))
 
-_MIN_WRITE_INTERVAL: float = 0.030  # 30 ms -> ~33 Hz BLE cap
+_MIN_WRITE_INTERVAL: float = 0.030
+_MAGIC = 0xDB
 
 log = logging.getLogger("relay")
 
@@ -48,9 +50,6 @@ class UDPCmd(IntEnum):
     PING = 0xFF
 
 
-_MAGIC = 0xDB
-
-
 class _BLERelay:
     """Persistent BLE connection with auto-reconnect and write coalescing."""
 
@@ -63,9 +62,12 @@ class _BLERelay:
     _MAX_RECONNECT = 5
     _HANDSHAKE_RETRIES = 3
 
-    def __init__(self, address: str, profile: DeviceProfile) -> None:
+    def __init__(self, address: str, profile_key: str) -> None:
+        if profile_key not in PROFILES:
+            valid = ", ".join(sorted(PROFILES))
+            raise ValueError(f"Unknown profile {profile_key!r}. Valid: {valid}")
         self._address = address
-        self._profile = profile
+        self._profile = PROFILES[profile_key]
         self._client: BleakClient | None = None
         self._connected = False
         self._notify_data = bytearray()
@@ -132,7 +134,7 @@ class _BLERelay:
         cchip = b"CCHIP"
         uuid = self._profile.write_uuid
 
-        # Phase 1: request challenge
+        # Phase 1: request challenge.
         self._notify_event.clear()
         await self._client.write_gatt_char(
             uuid, build_packet(0x00, cchip), response=True,
@@ -146,7 +148,7 @@ class _BLERelay:
         r1 = rx[8] ^ 36
         r2 = rx[9] ^ 76
 
-        # Phase 2: send response
+        # Phase 2: send response.
         self._notify_event.clear()
         await self._client.write_gatt_char(
             uuid, build_packet(0x01, cchip + bytes([r1, r2])), response=True,
@@ -222,18 +224,19 @@ class _BLERelay:
 class _Server:
     """UDP front-end that coalesces colour commands for the BLE back-end."""
 
-    __slots__ = ("_ble", "_writes", "_start", "_pending")
+    __slots__ = ("_ble", "_writes", "_start", "_pending", "_last_bri")
 
     def __init__(self, ble: _BLERelay) -> None:
         self._ble = ble
         self._writes = 0
         self._start = time.perf_counter()
         self._pending: tuple[int, int, int, int] | None = None
+        self._last_bri: int = -1
 
     async def start(self) -> asyncio.DatagramTransport:
         loop = asyncio.get_running_loop()
         transport, _ = await loop.create_datagram_endpoint(
-            lambda: _Protocol(self),
+            lambda: _UDPProtocol(self),
             local_addr=(HOST, PORT),
         )
         log.info("UDP listening on %s:%d", HOST, PORT)
@@ -259,6 +262,16 @@ class _Server:
             else:
                 await asyncio.sleep(0.005)
 
+    async def _set_brightness(self, level: int) -> None:
+        """Send a brightness command only when the value changes.
+
+        Level 0 is intentionally rejected — the hardware treats 0 as
+        undefined.  Use the POWER OFF command to turn the strip off.
+        """
+        if level != self._last_bri and 0 < level <= 100:
+            await self._ble.write_cmd(build_packet(Cmd.BRIGHTNESS, bytes([level])))
+            self._last_bri = level
+
     async def handle(
         self,
         data: bytes,
@@ -270,13 +283,13 @@ class _Server:
             return
 
         cmd = data[1]
-        r = data[2] & 0xFF
-        g = data[3] & 0xFF
-        b = data[4] & 0xFF
-        w = data[5] & 0xFF
+        r, g, b, w = data[2], data[3], data[4], data[5]
 
         if cmd == UDPCmd.COLOR:
             self._pending = (r, g, b, w)
+            bri = data[6]
+            if bri > 0:
+                await self._set_brightness(bri)
         elif cmd == UDPCmd.MODE:
             await self._ble.write_cmd(build_packet(Cmd.SET_MODE, bytes([r, g])))
         elif cmd == UDPCmd.BRIGHTNESS:
@@ -294,8 +307,8 @@ class _Server:
             )
 
 
-class _Protocol(asyncio.DatagramProtocol):
-    """asyncio datagram adapter that dispatches to ``_Server``."""
+class _UDPProtocol(asyncio.DatagramProtocol):
+    """asyncio datagram adapter dispatching to ``_Server``."""
 
     __slots__ = ("_server", "_transport")
 
@@ -319,12 +332,7 @@ async def main() -> None:
         datefmt="%H:%M:%S",
     )
 
-    if PROFILE not in PROFILES:
-        valid = ", ".join(sorted(PROFILES))
-        log.error("Unknown profile %r. Valid: %s", PROFILE, valid)
-        return
-
-    ble = _BLERelay(ADDRESS, PROFILES[PROFILE])
+    ble = _BLERelay(ADDRESS, PROFILE)
     await ble.connect()
 
     server = _Server(ble)

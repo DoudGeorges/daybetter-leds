@@ -13,14 +13,22 @@ from pathlib import Path
 
 __all__ = ["Cmd", "DeviceProfile", "PROFILES", "build_packet", "crc16_modbus"]
 
+# Bluetooth Base UUID with a ``{}`` placeholder for the 16-bit short ID.
+_BASE_UUID = "0000{}-0000-1000-8000-00805f9b34fb"
+_HEADER = 0xA0
+
 
 def _load_dotenv() -> None:
     """Load ``.env`` from the project root into ``os.environ`` (defaults only)."""
     env_path = Path(__file__).resolve().parent / ".env"
     if not env_path.exists():
         return
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+    try:
+        text = env_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
@@ -75,11 +83,14 @@ def crc16_modbus(data: bytes | bytearray) -> int:
     return crc & 0xFFFF
 
 
-_HEADER = 0xA0
-
-
 def build_packet(cmd: int, payload: bytes = b"") -> bytes:
-    """Build a BLE write packet: ``[0xA0][cmd][len][payload...][crc16]``."""
+    """Build a BLE write packet: ``[0xA0][cmd][len][payload...][crc16]``.
+
+    Raises:
+        ValueError: If *payload* exceeds 252 bytes (single-byte length field).
+    """
+    if len(payload) > 252:
+        raise ValueError(f"Payload too large ({len(payload)} bytes, max 252)")
     length = len(payload) + 3
     buf = bytearray([_HEADER, cmd & 0xFF, length & 0xFF]) + bytearray(payload)
     crc = crc16_modbus(buf)
@@ -110,21 +121,17 @@ class DeviceProfile:
     scan: str
     device_class: int  # 1 = QC (Smart Light), 2 = HC (Magic Light)
 
-    @staticmethod
-    def _full_uuid(short_id: str) -> str:
-        return f"0000{short_id.lower()}-0000-1000-8000-00805f9b34fb"
-
     @property
     def service_uuid(self) -> str:
-        return self._full_uuid(self.service)
+        return _BASE_UUID.format(self.service.lower())
 
     @property
     def write_uuid(self) -> str:
-        return self._full_uuid(self.write)
+        return _BASE_UUID.format(self.write.lower())
 
     @property
     def notify_uuid(self) -> str:
-        return self._full_uuid(self.notify)
+        return _BASE_UUID.format(self.notify.lower())
 
     @property
     def is_qc(self) -> bool:

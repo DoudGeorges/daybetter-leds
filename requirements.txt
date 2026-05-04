@@ -1,5 +1,11 @@
-bleak>=0.21
-dbus-fast; sys_platform == "linux"
-dxcam; sys_platform == "win32"
-mss
-numpy
+# BLE communication
+bleak>=0.21,<4
+
+# Screen capture (Windows GPU-accelerated, optional on other platforms)
+dxcam>=0.3; sys_platform == "win32"
+
+# Screen capture (cross-platform fallback)
+mss>=9
+
+# Numeric / color science
+numpy>=1.24
