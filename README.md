@@ -39,20 +39,20 @@ All tuning options are at the top of `ambient/capture.py`.
 
 | Setting      | Default | Description                                   |
 | ------------ | ------- | --------------------------------------------- |
-| `SMOOTHING`  | `0.42`  | EMA retention (0.2 = gaming, 0.5 = film)      |
+| `SMOOTHING`  | `0.30`  | EMA retention (0.2 = gaming, 0.5 = film)      |
 | `SATURATION` | `1.4`   | OKLAB chroma boost (hue-preserving)            |
 | `GAMMA`      | `2.2`   | LED gamma (raise to 2.5 for dimmer mid-tones)  |
 | `BRIGHTNESS` | `100`   | LED brightness 0-100                           |
 | `MIN_GLOW`   | `6`     | Below this, LEDs blend toward warm amber       |
-| `DELTA`      | `0.012` | Min OKLAB dE to trigger an update              |
-| `MAX_FPS`    | `25`    | Max UDP packets per second                     |
+| `DELTA`      | `0.008` | Min OKLAB dE to trigger an update              |
+| `MAX_FPS`    | `30`    | Max UDP packets per second                     |
 
 ### Color Pipeline
 
 ```
 Screen -> downsample -> sRGB -> linear RGB -> OKLAB
--> luminance-weighted average -> temporal blend (5 frames)
--> adaptive EMA (3-tier + deadband) -> chroma boost
+-> luminance-weighted average -> temporal blend (3 frames)
+-> adaptive EMA (4-tier + deadband) -> chroma boost
 -> brightness scale -> linear RGB -> LED gamma LUT -> uint8
 ```
 
