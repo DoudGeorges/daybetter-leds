@@ -1,0 +1,4 @@
+bleak>=0.21
+numpy
+dxcam
+mss
