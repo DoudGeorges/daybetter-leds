@@ -19,7 +19,7 @@ from pathlib import Path
 from bleak import BleakClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from protocol import CCHIP_TABLE, Cmd, PROFILES, build_packet
+from protocol import Cmd, PROFILES, build_packet
 
 # Configuration
 
@@ -101,8 +101,8 @@ class _BLERelay:
             raise RuntimeError(f"Handshake phase 1 failed: {rx.hex()}")
 
         c1, c2 = rx[8], rx[9]
-        r1 = CCHIP_TABLE[((c1 >> 4) + (c1 & 0x0F)) % len(CCHIP_TABLE)]
-        r2 = CCHIP_TABLE[((c2 >> 4) + (c2 & 0x0F)) % len(CCHIP_TABLE)]
+        r1 = c1 ^ 36
+        r2 = c2 ^ 76
 
         # Phase 2: send response
         self._notify_event.clear()
